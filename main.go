@@ -6,7 +6,6 @@ import (
 	"compress/zlib"
 	"context"
 	"crypto/tls"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -34,40 +33,46 @@ import (
 )
 
 type Config struct {
-	InputPath  string
-	OutputPath string
-	DumpDir    string
-	UA         string
-	Workers    int
-	RPSLimit   int
-	MaxErr     int
-	MaxRetry   int
-	Force      bool
-	CT         time.Duration
-	RT         time.Duration
+	InputPath string
+	DumpDir   string
+	UA        string
+	Workers   int
+	RPSLimit  int
+	MaxErr    int
+	MaxRetry  int
+	Force     bool
+	CT        time.Duration
+	RT        time.Duration
 }
 
 type Job struct {
 	BaseURL string
+	Host    string
 	Path    string
 }
 
 type Result struct {
-	URL           string `json:"url"`
-	ContentType   string `json:"content_type"`
-	ContentLength int64  `json:"content_length"`
+	URL           string
+	ContentType   string
+	ContentLength int64
+}
+
+type hostTracker struct {
+	count int64
+	once  sync.Once
 }
 
 type Dumper struct {
-	cfg       Config
-	client    *http.Client
-	limiter   *rate.Limiter
-	seen      sync.Map
-	errCounts sync.Map
-	blocked   sync.Map
-	inflight  sync.WaitGroup
-	jobs      chan Job
-	results   chan Result
+	cfg          Config
+	client       *http.Client
+	limiter      *rate.Limiter
+	seen         sync.Map
+	errCounts    sync.Map
+	blocked      sync.Map
+	inflight     sync.WaitGroup
+	jobs         chan Job
+	results      chan Result
+	hostTrackers sync.Map
 }
 
 var version = "dev"
@@ -84,7 +89,6 @@ var (
 	htmlRegex = regexp.MustCompile(`(?i)^\s*<(!DOCTYPE|html)`)
 )
 
-
 func printError(f string, a ...any)   { cErr.Fprintf(os.Stdout, "[-] "+f+"\n", a...) }
 func printWarning(f string, a ...any) { cWarn.Fprintf(os.Stdout, "[!] "+f+"\n", a...) }
 func printSuccess(f string, a ...any) { cSucc.Fprintf(os.Stdout, "[+] "+f+"\n", a...) }
@@ -92,8 +96,7 @@ func printSuccess(f string, a ...any) { cSucc.Fprintf(os.Stdout, "[+] "+f+"\n", 
 func main() {
 	var cfg Config
 	flag.StringVar(&cfg.InputPath, "i", "-", "Input URLs")
-	flag.StringVar(&cfg.OutputPath, "o", "", "Output JSONL")
-	flag.StringVar(&cfg.DumpDir, "d", "dumps", "Dump directory")
+	flag.StringVar(&cfg.DumpDir, "o", "dumps", "Output directory")
 	flag.StringVar(&cfg.UA, "ua", "", "User-Agent")
 	flag.IntVar(&cfg.Workers, "w", 10, "Workers")
 	flag.IntVar(&cfg.RPSLimit, "rps", 50, "RPS")
@@ -145,7 +148,6 @@ func main() {
 	NewDumper(cfg, client, limiter).Run(ctx, urls)
 
 	cleanup(cfg.DumpDir)
-	reconstructRepos(cfg.DumpDir)
 }
 
 func NewDumper(cfg Config, client *http.Client, limiter *rate.Limiter) *Dumper {
@@ -156,6 +158,34 @@ func NewDumper(cfg Config, client *http.Client, limiter *rate.Limiter) *Dumper {
 		jobs:    make(chan Job, cfg.Workers),
 		results: make(chan Result, cfg.Workers),
 	}
+}
+
+func (c *Dumper) getTracker(host string) *hostTracker {
+	v, _ := c.hostTrackers.LoadOrStore(host, &hostTracker{})
+	return v.(*hostTracker)
+}
+
+func (c *Dumper) addHost(host string) {
+	atomic.AddInt64(&c.getTracker(host).count, 1)
+}
+
+func (c *Dumper) doneHost(host string) {
+	t := c.getTracker(host)
+	if atomic.AddInt64(&t.count, -1) == 0 {
+		t.once.Do(func() {
+			c.reconstructRepo(host)
+		})
+	}
+}
+
+func (c *Dumper) reconstructRepo(host string) {
+	repoPath := filepath.Join(c.cfg.DumpDir, host)
+	if _, err := os.Stat(filepath.Join(repoPath, ".git")); err != nil {
+		return
+	}
+	printSuccess("Reconstructing %s", host)
+	exec.Command("git", "-C", repoPath, "checkout", ".").Run()
+	exec.Command("git", "-C", repoPath, "reset", "--hard").Run()
 }
 
 func (c *Dumper) Run(ctx context.Context, urls []string) {
@@ -171,27 +201,22 @@ func (c *Dumper) Run(ctx context.Context, urls []string) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		var jsonEnc *json.Encoder
-		if c.cfg.OutputPath != "" {
-			f, err := os.Create(c.cfg.OutputPath)
-			if err == nil {
-				defer f.Close()
-				jsonEnc = json.NewEncoder(f)
-			}
-		}
 		for r := range c.results {
 			printSuccess("%s", r.URL)
-			if jsonEnc != nil {
-				jsonEnc.Encode(r)
-			}
 		}
 	}()
 
-	for _, u := range urls {
+	for _, rawURL := range urls {
+		u, err := url.Parse(rawURL)
+		if err != nil {
+			continue
+		}
+		c.addHost(u.Host)
 		c.inflight.Add(1)
 		select {
-		case c.jobs <- Job{BaseURL: u, Path: "/.git/index"}:
+		case c.jobs <- Job{BaseURL: rawURL, Host: u.Host, Path: "/.git/index"}:
 		case <-ctx.Done():
+			c.doneHost(u.Host)
 			c.inflight.Done()
 		}
 	}
@@ -205,12 +230,13 @@ func (c *Dumper) Run(ctx context.Context, urls []string) {
 
 func (c *Dumper) worker(ctx context.Context) {
 	for job := range c.jobs {
-		u, err := url.Parse(job.BaseURL)
-		if err != nil || c.isBlocked(u.Host) {
+		if c.isBlocked(job.Host) {
+			c.doneHost(job.Host)
 			c.inflight.Done()
 			continue
 		}
 		if err := c.limiter.Wait(ctx); err != nil {
+			c.doneHost(job.Host)
 			c.inflight.Done()
 			return
 		}
@@ -220,11 +246,12 @@ func (c *Dumper) worker(ctx context.Context) {
 
 func (c *Dumper) process(ctx context.Context, job Job) {
 	defer c.inflight.Done()
+	defer c.doneHost(job.Host)
 
 	u, _ := url.Parse(job.BaseURL)
 	u.Path = path.Join(u.Path, job.Path)
 	target := u.String()
-	localPath := filepath.Join(c.cfg.DumpDir, u.Host, u.Path)
+	localPath := filepath.Join(c.cfg.DumpDir, job.Host, u.Path)
 
 	if !c.cfg.Force {
 		if _, err := os.Stat(localPath); err == nil {
@@ -235,7 +262,7 @@ func (c *Dumper) process(ctx context.Context, job Job) {
 	resp, err := c.fetch(ctx, target)
 	if err != nil {
 		printError("Error: %s -> %v", target, err)
-		c.incErr(u.Host)
+		c.incErr(job.Host)
 		return
 	}
 	defer resp.Body.Close()
@@ -244,7 +271,7 @@ func (c *Dumper) process(ctx context.Context, job Job) {
 	case 200:
 	case 403:
 		printError("403: %s", target)
-		c.incErr(u.Host)
+		c.incErr(job.Host)
 		return
 	case 404:
 		printError("404: %s", target)
@@ -268,9 +295,11 @@ func (c *Dumper) process(ctx context.Context, job Job) {
 
 	save(localPath, data)
 
+	c.addHost(job.Host)
 	c.inflight.Add(1)
 	go func() {
 		defer c.inflight.Done()
+		defer c.doneHost(job.Host)
 		select {
 		case c.results <- Result{
 			URL:           target,
@@ -280,7 +309,7 @@ func (c *Dumper) process(ctx context.Context, job Job) {
 		case <-ctx.Done():
 			return
 		}
-		c.parseContent(ctx, data, job.Path, job.BaseURL)
+		c.parseContent(ctx, data, job.Path, job.BaseURL, job.Host)
 	}()
 }
 
@@ -300,7 +329,7 @@ func (c *Dumper) fetch(ctx context.Context, target string) (*http.Response, erro
 	return nil, lastErr
 }
 
-func (c *Dumper) parseContent(ctx context.Context, raw []byte, gitPath, baseURL string) {
+func (c *Dumper) parseContent(ctx context.Context, raw []byte, gitPath, baseURL, host string) {
 	switch {
 	case strings.HasSuffix(gitPath, "index"):
 		idx := &index.Index{}
@@ -312,10 +341,10 @@ func (c *Dumper) parseContent(ctx context.Context, raw []byte, gitPath, baseURL 
 			"/.git/refs/heads/master", "/.git/refs/heads/main",
 			"/.git/objects/info/packs",
 		} {
-			c.enqueuePath(ctx, baseURL, ep)
+			c.enqueuePath(ctx, baseURL, host, ep)
 		}
 		for _, e := range idx.Entries {
-			c.enqueueHash(ctx, baseURL, e.Hash.String())
+			c.enqueueHash(ctx, baseURL, host, e.Hash.String())
 		}
 
 	case strings.HasSuffix(gitPath, "objects/info/packs"):
@@ -326,8 +355,8 @@ func (c *Dumper) parseContent(ctx context.Context, raw []byte, gitPath, baseURL 
 				continue
 			}
 			packName := strings.TrimSpace(line[2:])
-			c.enqueuePath(ctx, baseURL, "/.git/objects/pack/"+packName)
-			c.enqueuePath(ctx, baseURL, "/.git/objects/pack/"+strings.Replace(packName, ".pack", ".idx", 1))
+			c.enqueuePath(ctx, baseURL, host, "/.git/objects/pack/"+packName)
+			c.enqueuePath(ctx, baseURL, host, "/.git/objects/pack/"+strings.Replace(packName, ".pack", ".idx", 1))
 		}
 
 	case strings.Contains(gitPath, "/.git/objects/") && !strings.Contains(gitPath, "/pack/"):
@@ -352,13 +381,13 @@ func (c *Dumper) parseContent(ctx context.Context, raw []byte, gitPath, baseURL 
 			}
 			switch o := parsed.(type) {
 			case *object.Commit:
-				c.enqueueHash(ctx, baseURL, o.TreeHash.String())
+				c.enqueueHash(ctx, baseURL, host, o.TreeHash.String())
 				for _, ph := range o.ParentHashes {
-					c.enqueueHash(ctx, baseURL, ph.String())
+					c.enqueueHash(ctx, baseURL, host, ph.String())
 				}
 			case *object.Tree:
 				for _, te := range o.Entries {
-					c.enqueueHash(ctx, baseURL, te.Hash.String())
+					c.enqueueHash(ctx, baseURL, host, te.Hash.String())
 				}
 			}
 		}()
@@ -369,37 +398,41 @@ func (c *Dumper) parseContent(ctx context.Context, raw []byte, gitPath, baseURL 
 			line := scanner.Text()
 			for _, part := range strings.Fields(line) {
 				if hashRegex.MatchString(part) {
-					c.enqueueHash(ctx, baseURL, part)
+					c.enqueueHash(ctx, baseURL, host, part)
 				}
 			}
 			if strings.Contains(line, "refs/") {
 				if ref := refsRegex.FindString(line); ref != "" {
-					c.enqueuePath(ctx, baseURL, "/.git/"+ref)
+					c.enqueuePath(ctx, baseURL, host, "/.git/"+ref)
 				}
 			}
 		}
 	}
 }
 
-func (c *Dumper) enqueueHash(ctx context.Context, baseURL, hash string) {
+func (c *Dumper) enqueueHash(ctx context.Context, baseURL, host, hash string) {
 	key := baseURL + hash
 	if _, loaded := c.seen.LoadOrStore(key, struct{}{}); !loaded {
+		c.addHost(host)
 		c.inflight.Add(1)
 		select {
-		case c.jobs <- Job{BaseURL: baseURL, Path: fmt.Sprintf("/.git/objects/%s/%s", hash[:2], hash[2:])}:
+		case c.jobs <- Job{BaseURL: baseURL, Host: host, Path: fmt.Sprintf("/.git/objects/%s/%s", hash[:2], hash[2:])}:
 		case <-ctx.Done():
+			c.doneHost(host)
 			c.inflight.Done()
 		}
 	}
 }
 
-func (c *Dumper) enqueuePath(ctx context.Context, baseURL, gitPath string) {
+func (c *Dumper) enqueuePath(ctx context.Context, baseURL, host, gitPath string) {
 	key := baseURL + gitPath
 	if _, loaded := c.seen.LoadOrStore(key, struct{}{}); !loaded {
+		c.addHost(host)
 		c.inflight.Add(1)
 		select {
-		case c.jobs <- Job{BaseURL: baseURL, Path: gitPath}:
+		case c.jobs <- Job{BaseURL: baseURL, Host: host, Path: gitPath}:
 		case <-ctx.Done():
+			c.doneHost(host)
 			c.inflight.Done()
 		}
 	}
@@ -447,20 +480,6 @@ func cleanup(root string) {
 		entries, _ := os.ReadDir(dirs[i])
 		if len(entries) == 0 {
 			os.Remove(dirs[i])
-		}
-	}
-}
-
-func reconstructRepos(root string) {
-	entries, _ := os.ReadDir(root)
-	for _, e := range entries {
-		if !e.IsDir() {
-			continue
-		}
-		repoPath := filepath.Join(root, e.Name())
-		if _, err := os.Stat(filepath.Join(repoPath, ".git")); err == nil {
-			exec.Command("git", "-C", repoPath, "checkout", ".").Run()
-			exec.Command("git", "-C", repoPath, "reset", "--hard").Run()
 		}
 	}
 }
