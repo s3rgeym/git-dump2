@@ -103,7 +103,7 @@ func main() {
 	flag.IntVar(&cfg.RPSLimit, "rps", 50, "RPS")
 	flag.IntVar(&cfg.MaxErr, "maxerr", 30, "Max errors per host")
 	flag.IntVar(&cfg.MaxRetry, "maxretry", 1, "Max retries on connection error")
-	flag.Int64Var(&cfg.MaxSize, "maxsize", 10*1024*1024, "Max file size in bytes (0 = unlimited)")
+	flag.Int64Var(&cfg.MaxSize, "maxsize", 128*1024*1024, "Max file size in bytes (0 = unlimited)")
 	flag.BoolVar(&cfg.Force, "f", false, "Force overwrite")
 	flag.DurationVar(&cfg.CT, "ct", 5*time.Second, "Connect timeout")
 	flag.DurationVar(&cfg.RT, "rt", 15*time.Second, "Request timeout")
